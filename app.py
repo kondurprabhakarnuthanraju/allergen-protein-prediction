@@ -1,84 +1,96 @@
-import json
+"""
+Protein Allergen Prediction — Streamlit app
+Expected files:
+  app.py
+  models/allergen_cnn_bilstm.keras   (your existing trained model)
+  models/metadata.json              (optional)
+  requirements.txt
+
+The app rebuilds the same CNN + BiLSTM architecture and loads weights from the
+.keras archive if direct model deserialization fails. This avoids the
+GlorotUniform(input_axes=...) config-deserialization error seen in some
+Keras-version combinations.
+"""
+
 from pathlib import Path
+import json
+import tempfile
+import zipfile
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
 import torch
 import esm
-import joblib
-import tensorflow as tf
 
-ROOT = Path(__file__).resolve().parent
-MODEL_PATH = ROOT / "models" / "allergen_cnn_bilstm.keras"
-SCALER_PATH = ROOT / "models" / "scaler.joblib"
-META_PATH = ROOT / "models" / "metadata.json"
 
-st.set_page_config(page_title="Protein Allergen Prediction", page_icon="🧬", layout="centered")
+# -------------------- Configuration --------------------
+APP_DIR = Path(__file__).resolve().parent
+MODEL_DIR = APP_DIR / "models"
+MODEL_PATH = MODEL_DIR / "allergen_cnn_bilstm.keras"
+METADATA_PATH = MODEL_DIR / "metadata.json"
+THRESHOLD = 0.57
+EMBEDDING_SIZE = 320
+MAX_SEQUENCE_LENGTH = 10000  # basic guard against accidental huge inputs
+
+
+# -------------------- Page setup --------------------
+st.set_page_config(
+    page_title="Protein Allergen Prediction",
+    page_icon="🧬",
+    layout="wide",
+)
+
 st.title("🧬 Protein Allergen Prediction")
-st.write("ESM-2 embeddings + CNN + BiLSTM")
-st.caption("Research prototype only. Predictions are not a substitute for experimental allergenicity testing.")
+st.write(
+    "Predict allergenicity from a protein amino-acid sequence using ESM-2 "
+    "embeddings and a CNN–BiLSTM classifier."
+)
+st.caption(
+    "Research/educational tool only. This prediction is not a clinical or "
+    "food-safety determination."
+)
 
-def validate_sequence(s):
-    seq = "".join(s.split()).upper()
-    allowed = set("ACDEFGHIKLMNPQRSTVWYBXZUO")
-    if not seq:
-        raise ValueError("Enter a protein amino-acid sequence.")
-    bad = sorted(set(seq) - allowed)
-    if bad:
-        raise ValueError("Unsupported characters: " + ", ".join(bad))
-    if len(seq) > 1022:
-        raise ValueError("Sequence is longer than 1022 residues; split it into shorter segments.")
-    return seq
 
-@st.cache_resource
-def load_artifacts():
-    if not MODEL_PATH.exists() or not SCALER_PATH.exists():
-        return None
-    # model = tf.keras.models.load_model(MODEL_PATH)
-    model = tf.keras.models.load_model(
-    MODEL_PATH,
-    compile=False
+# -------------------- Model architecture --------------------
+def create_model():
+    """Must match the architecture used when the model was trained."""
+    model = keras.Sequential(
+        [
+            keras.Input(shape=(320, 1)),
+            layers.Conv1D(128, kernel_size=5, activation="relu"),
+            layers.MaxPooling1D(pool_size=2),
+            layers.Dropout(0.3),
+            layers.Conv1D(64, kernel_size=3, activation="relu"),
+            layers.MaxPooling1D(pool_size=2),
+            layers.Dropout(0.3),
+            layers.Bidirectional(layers.LSTM(64, return_sequences=True)),
+            layers.Bidirectional(layers.LSTM(32)),
+            layers.Dropout(0.4),
+            layers.Dense(1, activation="sigmoid"),
+        ]
     )
-    scaler = joblib.load(SCALER_PATH)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    esm_model, alphabet = esm.pretrained.esm2_t6_8M_UR50D()
-    esm_model.eval().to(device)
-    return model, scaler, esm_model, alphabet, device
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss="binary_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
 
-def embed_one(seq, esm_model, alphabet, device):
-    converter = alphabet.get_batch_converter()
-    _, _, tokens = converter([("query", seq)])
-    tokens = tokens.to(device)
-    with torch.no_grad():
-        reps = esm_model(tokens, repr_layers=[6], return_contacts=False)["representations"][6]
-    vec = reps[0, 1:len(seq)+1].mean(dim=0).detach().cpu().numpy().astype(np.float32)
-    return vec.reshape(1, -1)
 
-artifacts = load_artifacts()
-if artifacts is None:
-    st.error("Trained model files are missing. Run `python train.py` successfully first; the app will not generate fake predictions.")
-    st.stop()
+def load_model_safely():
+    """Try normal loading first; fall back to loading weights from .keras ZIP."""
+    if not MODEL_PATH.exists():
+        return None, (
+            f"Trained model not found at `{MODEL_PATH}`. Add "
+            "`models/allergen_cnn_bilstm.keras` to your GitHub repository."
+        )
 
-sequence = st.text_area("Protein sequence", placeholder="Paste amino-acid sequence, e.g. MKK... ", height=150)
-if st.button("Predict allergenicity", type="primary"):
     try:
-        seq = validate_sequence(sequence)
-        model, scaler, esm_model, alphabet, device = artifacts
-        X = scaler.transform(embed_one(seq, esm_model, alphabet, device)).reshape(1, 320, 1)
-        probs = model.predict(X, verbose=0)[0]
-        pred = int(np.argmax(probs))
-        label = "Likely allergen" if pred == 1 else "Likely non-allergen"
-        st.subheader(label)
-        st.metric("Model score for predicted class", f"{float(probs[pred]) * 100:.1f}%")
-        st.write({
-            "non_allergen_score": round(float(probs[0]), 4),
-            "allergen_score": round(float(probs[1]), 4)
-        })
-        st.warning("These scores are model outputs, not calibrated clinical probabilities. Validate against independent data before scientific use.")
-    except Exception as e:
-        st.error(f"Prediction failed: {e}")
-
-if META_PATH.exists():
-    with st.expander("Model information"):
-        st.json(json.loads(META_PATH.read_text(encoding="utf-8")))
+        loaded = keras.models.load_model(MODEL_PATH, compile=False)
+        return loaded, None
+    except Exception as direct_error:
+        # A .keras file is a ZIP archive. Extract only its weights and load
