@@ -35,7 +35,11 @@ def validate_sequence(s):
 def load_artifacts():
     if not MODEL_PATH.exists() or not SCALER_PATH.exists():
         return None
-    model = tf.keras.models.load_model(MODEL_PATH)
+    # model = tf.keras.models.load_model(MODEL_PATH)
+    model = tf.keras.models.load_model(
+    MODEL_PATH,
+    compile=False
+    )
     scaler = joblib.load(SCALER_PATH)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     esm_model, alphabet = esm.pretrained.esm2_t6_8M_UR50D()
