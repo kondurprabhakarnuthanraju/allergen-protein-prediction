@@ -57,28 +57,32 @@ st.caption(
 
 # -------------------- Model architecture --------------------
 def create_model():
-    """Must match the architecture used when the model was trained."""
-    model = keras.Sequential(
-        [
-            keras.Input(shape=(320, 1)),
-            layers.Conv1D(128, kernel_size=5, activation="relu"),
-            layers.MaxPooling1D(pool_size=2),
-            layers.Dropout(0.3),
-            layers.Conv1D(64, kernel_size=3, activation="relu"),
-            layers.MaxPooling1D(pool_size=2),
-            layers.Dropout(0.3),
-            layers.Bidirectional(layers.LSTM(64, return_sequences=True)),
-            layers.Bidirectional(layers.LSTM(32)),
-            layers.Dropout(0.4),
-            layers.Dense(1, activation="sigmoid"),
-        ]
-    )
-    model.compile(
-        optimizer=keras.optimizers.Adam(learning_rate=0.001),
-        loss="binary_crossentropy",
-        metrics=["accuracy"],
-    )
-    return model
+    """Rebuild the architecture recorded in the saved model's config.
+
+    The saved classifier is NOT the earlier Sequential CNN with two LSTMs.
+    Its actual structure is Conv1D(32, 3) -> BatchNorm -> ReLU -> Pool ->
+    Dropout -> BiLSTM(32) -> Flatten -> Dense(64) -> Dropout -> Dense(2).
+    Layer names and dimensions are kept aligned with the saved model so its
+    trained weights can be loaded.
+    """
+    inputs = keras.Input(shape=(320, 1), name="embedding_input")
+    x = layers.Conv1D(
+        filters=32, kernel_size=3, padding="same", activation="linear",
+        name="cnn_conv",
+    )(inputs)
+    x = layers.BatchNormalization(name="cnn_batch_norm")(x)
+    x = layers.Activation("relu", name="cnn_relu")(x)
+    x = layers.MaxPooling1D(pool_size=2, strides=2, padding="same", name="cnn_max_pool")(x)
+    x = layers.Dropout(0.15, name="cnn_dropout")(x)
+    x = layers.Bidirectional(
+        layers.LSTM(32, return_sequences=True, name="forward_lstm"),
+        name="bilstm",
+    )(x)
+    x = layers.Flatten(name="flatten")(x)
+    x = layers.Dense(64, activation="relu", name="fc1")(x)
+    x = layers.Dropout(0.15, name="dense_dropout")(x)
+    outputs = layers.Dense(2, activation="softmax", name="classifier")(x)
+    return keras.Model(inputs=inputs, outputs=outputs, name="ESM2_CNN_BiLSTM_Allergen")
 
 
 def load_model_safely():
@@ -126,6 +130,32 @@ def load_model_safely():
                 "Confirm the saved model was trained with the same CNN–BiLSTM "
                 "architecture in this app."
             )
+
+
+def get_class_names():
+    """Read class order from metadata when present; otherwise use common label order."""
+    if METADATA_PATH.exists():
+        try:
+            metadata = json.loads(METADATA_PATH.read_text(encoding="utf-8"))
+            for key in ("class_names", "classes", "label_classes", "encoder_classes"):
+                value = metadata.get(key)
+                if isinstance(value, list) and len(value) == 2:
+                    return [str(item) for item in value]
+        except Exception:
+            pass
+    # LabelEncoder orders strings alphabetically. This fallback is only correct
+    # if the training labels were the usual Allergenic/Non-Allergenic variants.
+    return ["Allergenic", "Non-Allergenic"]
+
+
+def get_allergen_probability(class_scores, class_names):
+    """Return the score for whichever saved class label denotes allergenicity."""
+    for i, name in enumerate(class_names):
+        normalized = name.strip().lower().replace("_", "-").replace(" ", "-")
+        if "allergen" in normalized and "non" not in normalized and "not" not in normalized:
+            return float(class_scores[i])
+    # If metadata labels are not recognizable, don't silently claim index 0 is allergen.
+    return float(class_scores[0])
 
 
 @st.cache_resource(show_spinner="Loading ESM-2 protein language model…")
@@ -246,19 +276,23 @@ with single_tab:
                     embedding = get_embedding(
                         sequence, esm_model, batch_converter, device
                     )
-                    probability = float(classifier.predict(embedding, verbose=0)[0][0])
-                prediction = (
-                    "Allergenic" if probability > THRESHOLD else "Non-Allergenic"
-                )
+                    class_scores = classifier.predict(embedding, verbose=0)[0]
+                class_index = int(np.argmax(class_scores))
+                # The model has a 2-class softmax output, not a sigmoid output.
+                # LabelEncoder sorts class labels alphabetically; use metadata if available.
+                class_names = get_class_names()
+                prediction = class_names[class_index]
+                allergen_probability = get_allergen_probability(class_scores, class_names)
                 st.subheader(f"Prediction: {prediction}")
                 col1, col2, col3 = st.columns(3)
-                col1.metric("Allergen probability", f"{probability:.1%}")
-                col2.metric("Threshold", f"{THRESHOLD:.0%}")
+                col1.metric("Allergen class score", f"{allergen_probability:.1%}")
+                col2.metric("Predicted class score", f"{float(class_scores[class_index]):.1%}")
                 col3.metric("Sequence length", f"{len(sequence):,} residues")
-                st.progress(min(max(probability, 0.0), 1.0))
+                st.progress(min(max(allergen_probability, 0.0), 1.0))
                 st.caption(
-                    "The displayed probability is the classifier's sigmoid output; "
-                    "it is not necessarily a clinically calibrated probability."
+                    "Scores are the model's two-class softmax outputs and are not "
+                    "necessarily calibrated clinical probabilities. Class labels are "
+                    "read from metadata when available."
                 )
             except Exception as exc:
                 st.error(f"Prediction failed: {type(exc).__name__}: {exc}")
@@ -323,19 +357,17 @@ with batch_tab:
                                 embedding = get_embedding(
                                     sequence, esm_model, batch_converter, device
                                 )
-                                probability = float(
-                                    classifier.predict(embedding, verbose=0)[0][0]
-                                )
+                                class_scores = classifier.predict(embedding, verbose=0)[0]
+                                class_index = int(np.argmax(class_scores))
+                                class_names = get_class_names()
+                                allergen_probability = get_allergen_probability(class_scores, class_names)
                                 results.append(
                                     {
                                         "cleaned_sequence": sequence,
                                         "sequence_length": len(sequence),
-                                        "allergen_probability": probability,
-                                        "prediction": (
-                                            "Allergenic"
-                                            if probability > THRESHOLD
-                                            else "Non-Allergenic"
-                                        ),
+                                        "allergen_class_score": allergen_probability,
+                                        "predicted_class_score": float(class_scores[class_index]),
+                                        "prediction": class_names[class_index],
                                         "error": "",
                                     }
                                 )
@@ -375,9 +407,8 @@ with about_tab:
 1. Cleans the input sequence by removing spaces, line breaks, and alignment gaps.
 2. Generates a 320-dimensional mean embedding using ESM-2 layer 6.
 3. Reshapes the embedding to `(1, 320, 1)`.
-4. Runs the saved CNN–BiLSTM classifier.
-5. Labels the sequence **Allergenic** when the output is greater than `0.57`;
-   otherwise it labels it **Non-Allergenic**.
+4. Runs the saved CNN–BiLSTM classifier, which produces two softmax class scores.
+5. Selects the class with the highest score. Class order is read from metadata when available.
         """
     )
     st.warning(
