@@ -1,10 +1,10 @@
-# Python 3.11 recommended (Streamlit Community Cloud)
 streamlit==1.41.1
 numpy==1.26.4
 pandas==2.2.3
 scikit-learn==1.5.2
 joblib==1.4.2
 openpyxl==3.1.5
-tensorflow-cpu==2.15.1
+tensorflow-cpu==2.17.1
+keras==3.5.0
 torch==2.2.2
 fair-esm==2.0.0
