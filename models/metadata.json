@@ -1,0 +1,30 @@
+{
+  "embedding_model": "esm2_t6_8M_UR50D",
+  "embedding_dimension": 320,
+  "architecture": "Conv1D -> BatchNorm -> ReLU -> MaxPool -> Dropout -> BiLSTM -> Flatten -> Dense -> Softmax",
+  "label_mapping": {
+    "0": "non-allergen",
+    "1": "allergen"
+  },
+  "dataset_file": "pLM4Alg_protocol_allergens_dataset.xlsx",
+  "n_samples_after_deduplication": 15768,
+  "test_metrics": {
+    "accuracy": 0.9245402663284717,
+    "sensitivity": 0.9470074812967582,
+    "specificity": 0.9012903225806451,
+    "mcc": 0.8497166639436681,
+    "balanced_accuracy": 0.9241489019387017,
+    "roc_auc": 0.9770658032338508,
+    "confusion_matrix_labels_0_1": [
+      [
+        1397,
+        153
+      ],
+      [
+        85,
+        1519
+      ]
+    ]
+  },
+  "warning": "Metrics depend on dataset quality and split; similarity/homology leakage has not been ruled out."
+}

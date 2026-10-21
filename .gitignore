@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Training data and generated embeddings (do not publish by default)
+*.xlsx
+*.xls
+*.csv
+!requirements.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
